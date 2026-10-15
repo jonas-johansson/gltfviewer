@@ -472,6 +472,15 @@ typedef struct {
     float duration;
 } Anim;
 
+enum { JOB_UNUSED, JOB_PENDING, JOB_READY, JOB_DONE, JOB_FAILED };
+
+typedef struct {
+    SDL_AtomicInt state;
+    int srgb, lin; // which GL variants the materials need
+    unsigned char *pixels;
+    int w, h;
+} TexJob;
+
 typedef struct {
     cgltf_data *data;
     char path[4096];
@@ -484,6 +493,11 @@ typedef struct {
     int nmats;
     GLuint *tex_lin, *tex_srgb;
     int ntex;
+    TexJob *jobs; // one per texture, decoded on worker threads
+    SDL_Thread *workers[16];
+    int nworkers;
+    SDL_AtomicInt next_job, cancel;
+    int tex_needed, tex_finished;
     Node *nodes;
     int nnodes;
     int *roots;
@@ -494,7 +508,6 @@ typedef struct {
     int nanims;
     vec3 bmin, bmax;
     long tris;
-    int warned_unsupported;
     char warning[256];
 } Model;
 
@@ -517,6 +530,7 @@ static struct {
     GLuint white_tex, dummy_tbo, dummy_tbo_tex;
     Model *model;
     char error[512];
+    char loading[256]; // file name shown while the first model loads
     // camera
     float yaw, pitch, dist;
     vec3 target;
@@ -600,33 +614,35 @@ static unsigned char *load_image_pixels(Model *m, const cgltf_image *img, int *w
     return stbi_load(path, w, h, &comp, 4);
 }
 
-static GLuint get_texture(Model *m, int ti, int srgb) {
-    if (ti < 0 || ti >= m->ntex) return 0;
-    GLuint *slot = srgb ? &m->tex_srgb[ti] : &m->tex_lin[ti];
-    if (*slot) return *slot == (GLuint)-1 ? 0 : *slot;
-    const cgltf_texture *t = &m->data->textures[ti];
-    *slot = (GLuint)-1;
-    if (!t->image) {
-        if ((t->has_basisu || t->has_webp) && !m->warned_unsupported) {
-            snprintf(m->warning, sizeof m->warning, "Some textures use unsupported formats (KTX2/WebP)");
-            m->warned_unsupported = 1;
+// Decoding large PNG/JPEG textures is by far the slowest part of loading, so it runs on
+// worker threads in parallel. The model shows up right away without textures; each texture
+// is uploaded on the main thread as soon as its pixels are ready.
+static int SDLCALL texture_worker(void *userdata) {
+    Model *m = userdata;
+    while (!SDL_GetAtomicInt(&m->cancel)) {
+        int i = SDL_AddAtomicInt(&m->next_job, 1);
+        if (i >= m->ntex) break;
+        TexJob *j = &m->jobs[i];
+        if (SDL_GetAtomicInt(&j->state) != JOB_PENDING) continue;
+        j->pixels = load_image_pixels(m, m->data->textures[i].image, &j->w, &j->h);
+        if (!j->pixels) {
+            const cgltf_image *img = m->data->textures[i].image;
+            fprintf(stderr, "warning: could not load image %s\n", img->uri ? img->uri : "(embedded)");
         }
-        return 0;
+        SDL_SetAtomicInt(&j->state, j->pixels ? JOB_READY : JOB_FAILED);
     }
-    int w = 0, h = 0;
-    unsigned char *px = load_image_pixels(m, t->image, &w, &h);
-    if (!px) {
-        fprintf(stderr, "warning: could not load image %s\n", t->image->uri ? t->image->uri : "(embedded)");
-        return 0;
-    }
+    return 0;
+}
+
+static GLuint create_texture(const cgltf_texture *t, const TexJob *j, int srgb) {
     GLuint id;
     glGenTextures(1, &id);
     glActiveTexture(GL_TEXTURE0 + 8); // scratch unit so material bindings on 0..7 stay intact
     glBindTexture(GL_TEXTURE_2D, id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glTexImage2D(GL_TEXTURE_2D, 0, srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8, j->w, j->h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 j->pixels);
     glGenerateMipmap(GL_TEXTURE_2D);
-    stbi_image_free(px);
     GLint wrap_s = GL_REPEAT, wrap_t = GL_REPEAT, minf = GL_LINEAR_MIPMAP_LINEAR, magf = GL_LINEAR;
     if (t->sampler) {
         if (t->sampler->wrap_s) wrap_s = t->sampler->wrap_s;
@@ -641,8 +657,66 @@ static GLuint get_texture(Model *m, int ti, int srgb) {
     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 8.0f);
     while (glGetError() != GL_NO_ERROR) {
     }
-    *slot = id;
     return id;
+}
+
+static void start_texture_jobs(Model *m) {
+    m->jobs = calloc(m->ntex ? m->ntex : 1, sizeof(TexJob));
+    for (int i = 0; i < m->nmats; i++)
+        for (int k = 0; k < TEX_COUNT; k++) {
+            int ti = m->mats[i].tex[k];
+            if (ti < 0 || ti >= m->ntex) continue;
+            if (k == TEX_BASE || k == TEX_EMIS) m->jobs[ti].srgb = 1;
+            else m->jobs[ti].lin = 1;
+        }
+    for (int i = 0; i < m->ntex; i++) {
+        TexJob *j = &m->jobs[i];
+        if (!j->srgb && !j->lin) continue;
+        const cgltf_texture *t = &m->data->textures[i];
+        if (!t->image) {
+            if (t->has_basisu || t->has_webp)
+                snprintf(m->warning, sizeof m->warning, "Some textures use unsupported formats (KTX2/WebP)");
+            continue;
+        }
+        SDL_SetAtomicInt(&j->state, JOB_PENDING);
+        m->tex_needed++;
+    }
+    int n = SDL_min(SDL_GetNumLogicalCPUCores(), (int)SDL_arraysize(m->workers));
+    n = SDL_min(n, m->tex_needed);
+    for (int i = 0; i < n; i++) {
+        m->workers[m->nworkers] = SDL_CreateThread(texture_worker, "texture", m);
+        if (m->workers[m->nworkers]) m->nworkers++;
+    }
+    if (m->tex_needed > 0 && m->nworkers == 0) texture_worker(m); // no threads: decode synchronously
+}
+
+// Upload decoded textures to the GPU, spending at most budget_ms per call (but always at least
+// one texture). Returns 1 while textures are still loading.
+static int pump_textures(Model *m, double budget_ms) {
+    Uint64 start = SDL_GetTicksNS();
+    for (int i = 0; i < m->ntex && m->tex_finished < m->tex_needed; i++) {
+        TexJob *j = &m->jobs[i];
+        int st = SDL_GetAtomicInt(&j->state);
+        if (st == JOB_FAILED) {
+            SDL_SetAtomicInt(&j->state, JOB_DONE);
+            m->tex_finished++;
+        } else if (st == JOB_READY) {
+            if (SDL_GetTicksNS() - start > (Uint64)(budget_ms * 1e6)) break;
+            const cgltf_texture *t = &m->data->textures[i];
+            if (j->srgb) m->tex_srgb[i] = create_texture(t, j, 1);
+            if (j->lin) m->tex_lin[i] = create_texture(t, j, 0);
+            stbi_image_free(j->pixels);
+            j->pixels = NULL;
+            SDL_SetAtomicInt(&j->state, JOB_DONE);
+            m->tex_finished++;
+        }
+    }
+    return m->tex_finished < m->tex_needed;
+}
+
+static GLuint get_texture(Model *m, int ti, int srgb) {
+    if (ti < 0 || ti >= m->ntex) return 0;
+    return srgb ? m->tex_srgb[ti] : m->tex_lin[ti];
 }
 
 static int tex_index(const Model *m, const cgltf_texture_view *v) {
@@ -980,6 +1054,10 @@ static void load_anims(Model *m) {
 
 static void free_model(Model *m) {
     if (!m) return;
+    SDL_SetAtomicInt(&m->cancel, 1);
+    for (int i = 0; i < m->nworkers; i++) SDL_WaitThread(m->workers[i], NULL);
+    for (int i = 0; m->jobs && i < m->ntex; i++) stbi_image_free(m->jobs[i].pixels);
+    free(m->jobs);
     for (int i = 0; i < m->nprims; i++) {
         Prim *p = &m->prims[i];
         glDeleteVertexArrays(1, &p->vao);
@@ -990,8 +1068,8 @@ static void free_model(Model *m) {
         free(p->cpu_weights);
     }
     for (int i = 0; i < m->ntex; i++) {
-        if (m->tex_lin[i] && m->tex_lin[i] != (GLuint)-1) glDeleteTextures(1, &m->tex_lin[i]);
-        if (m->tex_srgb[i] && m->tex_srgb[i] != (GLuint)-1) glDeleteTextures(1, &m->tex_srgb[i]);
+        if (m->tex_lin[i]) glDeleteTextures(1, &m->tex_lin[i]);
+        if (m->tex_srgb[i]) glDeleteTextures(1, &m->tex_srgb[i]);
     }
     for (int i = 0; i < m->nnodes; i++) free(m->nodes[i].children);
     for (int i = 0; i < m->nskins; i++) {
@@ -1214,6 +1292,7 @@ static Model *load_model(const char *path, char *err, size_t errlen) {
     m->tex_lin = calloc(m->ntex ? m->ntex : 1, sizeof(GLuint));
     m->tex_srgb = calloc(m->ntex ? m->ntex : 1, sizeof(GLuint));
     load_materials(m);
+    start_texture_jobs(m);
 
     size_t total = 0;
     for (size_t i = 0; i < data->meshes_count; i++) total += data->meshes[i].primitives_count;
@@ -1372,12 +1451,19 @@ static void build_hud(void) {
             hud_text(pad, y, buf, dim);
             y += lh;
         }
+        if (m->tex_finished < m->tex_needed) {
+            snprintf(buf, sizeof buf, "Loading textures %d/%d...", m->tex_finished, m->tex_needed);
+            hud_text(pad, y, buf, amber);
+            y += lh;
+        }
         if (m->warning[0]) {
             hud_text(pad, y, m->warning, amber);
             y += lh;
         }
     } else if (!G.error[0]) {
-        const char *msg = "Drop a .gltf or .glb file here, or press O to open one";
+        char loading[300];
+        snprintf(loading, sizeof loading, "Loading %.256s...", G.loading);
+        const char *msg = G.loading[0] ? loading : "Drop a .gltf or .glb file here, or press O to open one";
         hud_text((G.fb_w - hud_text_width(msg)) * 0.5f, G.fb_h * 0.5f - lh * 0.5f, msg, white);
     }
     if (G.error[0]) {
@@ -1763,6 +1849,7 @@ static int write_screenshot(const char *out, int w, int h) {
     G.density = 1;
     frame_model();
     if (G.model) {
+        while (pump_textures(G.model, 1000)) SDL_Delay(1);
         evaluate_scene(G.model);
         update_skins(G.model);
     }
@@ -1824,14 +1911,22 @@ int main(int argc, char **argv) {
     init_gl_objects();
     G.show_grid = 1;
     reset_view();
+    if (file && !screenshot) {
+        // Put the window on screen before parsing the file, so it appears instantly.
+        snprintf(G.loading, sizeof G.loading, "%s", basename_of(file));
+        render();
+        SDL_GL_SwapWindow(G.win);
+    }
     if (file) open_path(file);
+    G.loading[0] = 0;
     if (screenshot) return write_screenshot(screenshot, 1280, 800);
 
     int running = 1, dirty = 1;
     Uint64 last = SDL_GetPerformanceCounter();
     Uint64 last_click = 0;
     while (running) {
-        int animating = (G.model && G.playing && G.model->nanims > 0) || G.auto_rotate;
+        int loading = G.model && G.model->tex_finished < G.model->tex_needed;
+        int animating = (G.model && G.playing && G.model->nanims > 0) || G.auto_rotate || loading;
         SDL_Event e;
         int have = animating || dirty ? SDL_PollEvent(&e) : SDL_WaitEventTimeout(&e, 1000);
         while (have) {
@@ -1935,6 +2030,9 @@ int main(int argc, char **argv) {
         if (G.auto_rotate) G.yaw += (float)dt * 0.5f;
         Model *m = G.model;
         if (m) {
+            int before = m->tex_finished;
+            pump_textures(m, 8);
+            if (m->tex_finished != before) dirty = 1;
             if (m->nanims > 0) {
                 Anim *a = &m->anims[G.anim];
                 if (G.playing) G.anim_time += dt;
