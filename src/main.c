@@ -207,6 +207,7 @@ static const char *MESH_FS =
     "uniform vec4 u_base_color;\n"
     "uniform float u_metallic, u_roughness, u_normal_scale, u_occ_strength;\n"
     "uniform vec3 u_emissive;\n"
+    "uniform float u_specular; uniform vec3 u_specular_color;\n"
     "uniform sampler2D t_base, t_mr, t_normal, t_occ, t_emis;\n"
     "uniform int u_has_base, u_has_mr, u_has_normal, u_has_occ, u_has_emis;\n"
     "uniform int u_uv_base, u_uv_mr, u_uv_normal, u_uv_occ, u_uv_emis;\n"
@@ -270,7 +271,13 @@ static const char *MESH_FS =
     "  vec3 v = normalize(u_cam_pos - v_pos);\n"
     "  float nv = clamp(abs(dot(n, v)), 0.001, 1.0);\n"
     "  vec3 diffuse_col = base.rgb * (1.0 - metal);\n"
-    "  vec3 f0 = mix(vec3(0.04), base.rgb, metal);\n"
+    "  // KHR_materials_specular: scales the dielectric reflectance (defaults are 1 / white)\n"
+    "  vec3 f0 = mix(min(vec3(0.04) * u_specular_color, vec3(1.0)) * u_specular, base.rgb, metal);\n"
+    "  vec3 f90 = vec3(mix(u_specular, 1.0, metal));\n"
+    "  // specular anti-aliasing: widen highlights where the normal changes faster than a pixel\n"
+    "  vec3 dndx = dFdx(n), dndy = dFdy(n);\n"
+    "  float variance = 0.25 * (dot(dndx, dndx) + dot(dndy, dndy));\n"
+    "  rough = sqrt(sqrt(clamp(pow(rough, 4.0) + min(2.0 * variance, 0.18), 0.0, 1.0)));\n"
     "  float a = rough * rough;\n"
     "  vec3 col = vec3(0.0);\n"
     "  for (int i = 0; i < 3; i++) {\n"
@@ -279,7 +286,7 @@ static const char *MESH_FS =
     "    float nl = clamp(dot(n, l), 0.0, 1.0);\n"
     "    if (nl <= 0.0) continue;\n"
     "    float nh = clamp(dot(n, h), 0.0, 1.0), vh = clamp(dot(v, h), 0.0, 1.0);\n"
-    "    vec3 F = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);\n"
+    "    vec3 F = f0 + (f90 - f0) * pow(1.0 - vh, 5.0);\n"
     "    float a2 = a * a;\n"
     "    float d = nh * nh * (a2 - 1.0) + 1.0;\n"
     "    float D = a2 / (PI * d * d);\n"
@@ -293,7 +300,7 @@ static const char *MESH_FS =
     "  vec3 irr = mix(u_ground, u_sky, 0.5 + 0.5 * n.y) + 0.15;\n"
     "  vec2 ab = env_brdf(rough, nv);\n"
     "  vec3 r = reflect(-v, n);\n"
-    "  vec3 amb = diffuse_col * irr + env(r, rough) * (f0 * ab.x + ab.y);\n"
+    "  vec3 amb = diffuse_col * irr + env(r, rough) * (f0 * ab.x + f90 * ab.y);\n"
     "  float ao = 1.0;\n"
     "  if (u_has_occ == 1) ao = 1.0 + u_occ_strength * (texture(t_occ, uvsel(u_uv_occ)).r - 1.0);\n"
     "  col += amb * ao;\n"
@@ -410,6 +417,7 @@ typedef struct {
     float base[4];
     float metallic, roughness, normal_scale, occ_strength;
     float emissive[3];
+    float specular, specular_color[3];
     int tex[TEX_COUNT]; // cgltf texture index or -1
     int uv[TEX_COUNT];
     int alpha_mode;
@@ -546,7 +554,7 @@ static struct {
 
 static struct {
     GLint model, nmat, viewproj, skinned, joint_tex;
-    GLint base_color, metallic, roughness, normal_scale, occ_strength, emissive;
+    GLint base_color, metallic, roughness, normal_scale, occ_strength, emissive, specular, specular_color;
     GLint t[TEX_COUNT], has[TEX_COUNT], uvs[TEX_COUNT];
     GLint alpha_mode, alpha_cutoff, unlit, has_tangent, cam_pos, light_dir, light_col;
     GLint sky, horizon, ground, exposure;
@@ -734,6 +742,12 @@ static void load_materials(Model *m) {
         mt->base[0] = mt->base[1] = mt->base[2] = mt->base[3] = 1;
         mt->metallic = 1;
         mt->roughness = 1;
+        mt->specular = 1;
+        mt->specular_color[0] = mt->specular_color[1] = mt->specular_color[2] = 1;
+        if (cm->has_specular) {
+            mt->specular = cm->specular.specular_factor;
+            memcpy(mt->specular_color, cm->specular.specular_color_factor, sizeof mt->specular_color);
+        }
         if (cm->has_pbr_metallic_roughness) {
             const cgltf_pbr_metallic_roughness *p = &cm->pbr_metallic_roughness;
             memcpy(mt->base, p->base_color_factor, sizeof mt->base);
@@ -1521,7 +1535,7 @@ static void draw_item(Model *m, const DrawItem *it) {
     Prim *p = &m->prims[it->prim];
     Node *n = &m->nodes[it->node];
     static const Material def = {
-        {0.8f, 0.8f, 0.8f, 1}, 0.0f, 0.6f, 1, 1, {0, 0, 0}, {-1, -1, -1, -1, -1}, {0}, ALPHA_OPAQUE, 0.5f, 0, 0};
+        {0.8f, 0.8f, 0.8f, 1}, 0.0f, 0.6f, 1, 1, {0, 0, 0}, 1, {1, 1, 1}, {-1, -1, -1, -1, -1}, {0}, ALPHA_OPAQUE, 0.5f, 0, 0};
     const Material *mt = p->material >= 0 && p->material < m->nmats ? &m->mats[p->material] : &def;
 
     glUniform4fv(U.base_color, 1, mt->base);
@@ -1530,6 +1544,8 @@ static void draw_item(Model *m, const DrawItem *it) {
     glUniform1f(U.normal_scale, mt->normal_scale);
     glUniform1f(U.occ_strength, mt->occ_strength);
     glUniform3fv(U.emissive, 1, mt->emissive);
+    glUniform1f(U.specular, mt->specular);
+    glUniform3fv(U.specular_color, 1, mt->specular_color);
     glUniform1i(U.alpha_mode, mt->alpha_mode);
     glUniform1f(U.alpha_cutoff, mt->cutoff);
     glUniform1i(U.unlit, mt->unlit);
@@ -1762,6 +1778,8 @@ static void init_gl_objects(void) {
     LOC(normal_scale, "u_normal_scale");
     LOC(occ_strength, "u_occ_strength");
     LOC(emissive, "u_emissive");
+    LOC(specular, "u_specular");
+    LOC(specular_color, "u_specular_color");
     LOC(alpha_mode, "u_alpha_mode");
     LOC(alpha_cutoff, "u_alpha_cutoff");
     LOC(unlit, "u_unlit");

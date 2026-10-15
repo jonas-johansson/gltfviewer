@@ -46,7 +46,7 @@ You can also drag and drop a file onto the window.
 
 - Metallic-roughness PBR with base color, metal/rough, normal, occlusion and emissive maps. Spec-gloss materials get an approximate conversion.
 - Alpha modes opaque, mask and blend (blended geometry is sorted back to front), and double-sided materials.
-- `KHR_materials_unlit` and `KHR_materials_emissive_strength`.
+- `KHR_materials_unlit`, `KHR_materials_emissive_strength` and `KHR_materials_specular` (factors only).
 - Embedded, data-URI and external buffers and images.
 - Node animation (step, linear and cubic-spline) and skinning.
 
