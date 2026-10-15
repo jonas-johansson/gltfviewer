@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=glTF Viewer
+GenericName=3D Model Viewer
+Comment=View glTF and GLB 3D models in real time
+Exec=@BINDIR@/gltfviewer %f
+Icon=gltfviewer
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;
+MimeType=model/gltf+json;model/gltf-binary;
+StartupWMClass=gltfviewer
