@@ -1,4 +1,4 @@
 gltfviewer
 *.o
 *.png
-!data/*.png
+!docs/*.png

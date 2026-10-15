@@ -2,6 +2,10 @@
 
 A small native glTF 2.0 viewer for Linux and Omarchy, built with SDL3 and OpenGL 3.3. It opens `.gltf` and `.glb` files and renders them in real time.
 
+![gltfviewer showing the animated Fox sample model](docs/screenshot.png)
+
+<sub>Fox model: PixelMannen (CC0), rigging and animation by tomkranis (CC BY 4.0), conversion by @AsoboStudio and @scurest (CC BY 4.0). Taken from the [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox).</sub>
+
 ## Build & install
 
 ```sh
