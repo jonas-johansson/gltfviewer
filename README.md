@@ -47,3 +47,7 @@ You can also drag and drop a file onto the window.
 - Node animation (step, linear and cubic-spline) and skinning.
 
 **Not supported yet:** morph targets, Draco or meshopt compression, KTX2 or WebP textures, `KHR_texture_transform`, and lights or cameras defined in the file.
+
+## License
+
+Public domain ([Unlicense](LICENSE)). The libraries in `third_party/` keep their own licenses (MIT or public domain).
